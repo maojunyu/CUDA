@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SGEMM V5 分块详解（register tiling + float4）</title>
+<style>
+  :root {
+    --bg:#0f172a; --card:#1e293b; --card2:#273449; --text:#e2e8f0; --muted:#94a3b8;
+    --accent:#38bdf8; --a:#38bdf8; --b:#a78bfa; --c:#fbbf24;
+    --block:#f59e0b; --thread:#10b981; --k:#ef4444; --border:#334155; --hi:#fef08a;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; line-height:1.7; padding:24px; max-width:1150px; margin:0 auto; }
+  h1 { font-size:25px; margin-bottom:4px; }
+  h1 .en { color:var(--accent); }
+  .sub { color:var(--muted); margin-bottom:16px; font-size:14px; }
+  h2 { font-size:19px; margin:26px 0 10px; color:var(--accent); }
+  h3 { font-size:15px; margin:14px 0 6px; }
+  p { font-size:14.5px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px 18px; margin:12px 0; }
+  .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:880px){ .grid-2{ grid-template-columns:1fr; } }
+  .params { display:flex; flex-wrap:wrap; gap:10px; margin:10px 0 2px; }
+  .param { background:var(--card2); border-radius:8px; padding:8px 12px; font-size:13px; text-align:center; min-width:100px; }
+  .param b { display:block; font-size:15px; color:var(--accent); }
+  .param span { color:var(--muted); font-size:12px; }
+  svg { width:100%; height:auto; display:block; background:#0b1220; border-radius:8px; }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:var(--muted); margin:8px 0 4px; }
+  .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; margin:10px 0; }
+  th,td { border:1px solid var(--border); padding:8px 10px; text-align:left; }
+  th { background:var(--card2); color:var(--accent); }
+  code { background:#0b1220; border:1px solid var(--border); border-radius:5px; padding:1px 6px; font-family:Consolas,"Courier New",monospace; font-size:13px; color:#7dd3fc; }
+  .formula { background:#0b1220; border-left:3px solid var(--accent); padding:10px 14px; border-radius:6px; font-family:Consolas,monospace; font-size:13.5px; margin:10px 0; overflow-x:auto; }
+  .btn { background:var(--accent); color:#0f172a; border:none; border-radius:8px; padding:9px 18px; font-size:14px; font-weight:600; cursor:pointer; margin:4px 8px 4px 0; transition:filter .15s; }
+  .btn:hover { filter:brightness(1.15); }
+  .btn.ghost { background:var(--card2); color:var(--text); border:1px solid var(--border); font-weight:400; }
+  .step-ind { font-size:14px; color:var(--hi); font-weight:600; }
+  .note { font-size:13px; color:var(--muted); border-left:3px solid var(--block); padding:6px 12px; margin:8px 0; background:rgba(245,158,11,.06); border-radius:0 6px 6px 0; }
+  .arrow { font-size:13px; fill:var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>SGEMM <span class="en">V5</span> 分块策略详解</h1>
+<div class="sub">cudaSgemm_V5：每个 block 算 128×128 输出块 · 每个线程算 8×8 微块 · K 方向按 BK=8 条带循环 · float4 向量化</div>
+
+<div class="params">
+  <div class="param"><b>M=N=K=4096</b><span>矩阵尺寸</span></div>
+  <div class="param"><b>BM=BN=128</b><span>每个 block 的输出 tile</span></div>
+  <div class="param"><b>BK=8</b><span>K 方向条带宽度</span></div>
+  <div class="param"><b>16×16=256</b><span>每 block 线程数</span></div>
+  <div class="param"><b>TM=TN=8</b><span>每线程微块 8×8</span></div>
+  <div class="param"><b>32×32=1024</b><span>grid 中 block 数</span></div>
+  <div class="param"><b>512 次</b><span>K 循环迭代数</span></div>
+</div>
+
+<h2>① 第一层分块：C 被切成 32×32 个 block</h2>
+<div class="card">
+<p>把输出 C(4096×4096)按 <code>BM×BN = 128×128</code> 切成 <code>32×32 = 1024</code> 个块（4096 ÷ 128 = 32），<b>每个 GPU block 独立计算一个 tile</b>。</p>
+<p style="margin-top:6px">以 <code>block(4, 7)</code> 为例：<b>C(4×128, 7×128) = C(512, 896)</b>，负责 C 的 <b>512~640 行 × 896~1024 列</b>。它只需要两份输入：A 的第 4 行块（512~640 行 × 全部 K 列）和 B 的第 7 列块（全部 K 行 × 896~1024 列）。</p>
+<svg id="s1" viewBox="0 0 980 300"></svg>
+<div class="legend">
+  <span><i style="background:var(--a)"></i>A 第 4 行块（rows 512~640 × 全部 K 列）</span>
+  <span><i style="background:var(--b)"></i>B 第 7 列块（全部 K 行 × cols 896~1024）</span>
+  <span><i style="background:var(--c)"></i>block(4,7) 的 128×128 输出 tile</span>
+  <span><i style="background:#64748b"></i>虚线 = 行列对齐</span>
+</div>
+</div>
+
+<h2>② 第二层分块：K 方向按 BK=8 切条带</h2>
+<div class="card">
+<p>一个 block 要的输入太大（128 行 × 全部 4096 列），共享内存放不下。于是把 K 切成 <code>K/BK = 512</code> 个条带，<b>每次迭代只搬一对 8 宽的条带进共享内存</b>。</p>
+<p style="margin-top:6px">注意两条带的<b>形状和摆放方向不同</b>：A 条带是<b>竖条</b>（128 行 × 8 列，竖着的 128 是 M 行方向），512 个竖条沿 K <b>横向排开</b>；B 条带是<b>横条</b>（8 行 × 128 列，横着的 128 是 N 列方向），512 个横条沿 K <b>纵向堆叠</b>——因为 K 在 A 里是列号、在 B 里是行号。</p>
+<div class="formula">for (kb = 0; kb < 4096; kb += 8) {   // 512 次迭代
+    加载 A 竖条(128×8) → As；加载 B 横条(8×128) → Bs
+    128×128 tile 累加 += 条带外积
+}</div>
+<svg id="s2" viewBox="0 0 980 300"></svg>
+<div class="legend">
+  <span><i style="background:var(--k)"></i>当前第 256 个条带</span>
+  <span><i style="background:#2b5d8a"></i>A：竖条（128 行 × 8 列）</span>
+  <span><i style="background:#5b4b9e"></i>B：横条（8 行 × 128 列）</span>
+  <span><i style="background:#4a5b74"></i>其余条带</span>
+</div>
+</div>
+
+<h2>③ 块内分工：16×16 线程，每人一个 8×8 微块</h2>
+<div class="card">
+<p>block 内有 <code>16×16=256</code> 个线程，128×128 的 tile 再切成 <b>8×8 的微块</b>，每个线程负责一块：</p>
+<div class="formula">threadRow = ty * 8      // 线程微块的行起点（0,8,...,120）
+threadCol = tx * 8      // 线程微块的列起点（0,8,...,120）
+// 该线程累加 acc[8][8]，最终写回 C[threadRow..+8][threadCol..+8]</div>
+<svg id="s3" viewBox="0 0 980 300"></svg>
+<div class="legend">
+  <span><i style="background:var(--thread)"></i>线程 (ty=3, tx=9) 的 8×8 微块</span>
+  <span><i style="background:var(--a)"></i>它需要读的 A 片段（8 行 × 固定 k）</span>
+  <span><i style="background:var(--b)"></i>它需要读的 B 片段（固定 k × 8 列）</span>
+</div>
+</div>
+
+<h2>④ 线程搬运分工：256 个 float4 怎么分</h2>
+<div class="card">
+<p>一个 A 条带（128×8）和一个 B 条带（8×128）都是 <b>1024 个 float = 256 个 float4</b>，block 里正好 <b>256 个线程</b>，所以<b>每个线程每轮只搬 1 个 float4</b>，一轮正好搬完。线程线性编号 <code>i = ty×16 + tx</code>（tx 变化最快）：</p>
+<p style="margin-top:6px"><b>A 条带</b>：每行 8 列 = 2 个 float4 → <code>row = i / 2</code>，<code>col = (i % 2) × 4</code>。线程 0、1 搬第 0 行，2、3 搬第 1 行……254、255 搬第 127 行（从上到下、从左到右）。</p>
+<p style="margin-top:6px"><b>B 条带</b>：每行 128 列 = 32 个 float4 → <code>row = i / 32</code>，<code>col = (i % 32) × 4</code>。线程 0~31 搬第 0 行，32~63 搬第 1 行……224~255 搬第 7 行。</p>
+<p style="margin-top:6px">循环写成 <code>for (i = 线程号; i &lt; 256; i += 256)</code> 是为了通用性：若 BK=16，条带有 512 个 float4，每个线程自动搬 2 轮。</p>
+<svg id="s35" viewBox="0 0 980 360"></svg>
+<div class="legend">
+  <span><i style="background:#155e8f"></i>A 条带（128 行 × 8 列 = 256 float4）</span>
+  <span><i style="background:#504099"></i>B 条带（8 行 × 128 列 = 256 float4）</span>
+  <span><i style="background:#fef08a"></i>1 个 float4 = 4 个连续 float = 16 字节</span>
+</div>
+</div>
+
+<h2>⑤ 计算部分：寄存器微块 + 逐 k 外积</h2>
+<div class="card">
+<p>搬运完条带后，两个条带做乘法就得到 128×128 的累加。V5 与 V4 的区别不在"分割输出"，而在<b>循环顺序</b>：先把 A/B 各 8 个操作数装进寄存器，再做 8×8 外积，让一次加载被 8 次 FMA 复用。</p>
+<p style="margin-top:6px">每个线程 <code>(ty, tx)</code> 负责输出微块 <code>C[threadRow..+8][threadCol..+8]</code>。对条带内每个 k（0..7），它读 A 的 <code>As[k][threadRow..+7]</code>（8 个值）和 B 的 <code>Bs[k][threadCol..+7]</code>（8 个值），做一次 rank-1 外积累加：</p>
+<div class="formula">for (k = 0; k &lt; 8; ++k) {
+    a[8] = As[k][threadRow..+7];  b[8] = Bs[k][threadCol..+7];   // 16 次读（4×float4）
+    for (m) for (n) acc[m][n] += a[m] * b[n];                     // 64 个 FMA
+}</div>
+<svg id="s5c" viewBox="0 0 980 360"></svg>
+<div style="margin:8px 0 4px">
+  <button class="btn" id="kStep">k + 1 →</button>
+  <button class="btn ghost" id="kAuto">▶ 自动</button>
+  <button class="btn ghost" id="kReset">重置</button>
+  <span class="step-ind" id="kTxt" style="margin-left:8px"></span>
+</div>
+<div class="legend">
+  <span><i style="background:#7dd3fc"></i>线程(ty=3) 的 A 片 As[k][24..32)（8 个值）</span>
+  <span><i style="background:#c4b5fd"></i>线程(tx=9) 的 B 片 Bs[k][72..80)（8 个值）</span>
+  <span><i style="background:#10b981"></i>acc[8][8]（64 个寄存器累加器）</span>
+  <span><i style="background:var(--k)"></i>当前第 k 行</span>
+</div>
+<h3>补充：内积 vs 外积（为什么这样算）</h3>
+<p>矩阵乘法有两种等价写法，V4 用<b>内积</b>、V5 用<b>外积</b>，循环顺序相反、结果相同：</p>
+<p style="margin-top:6px"><b>内积</b>（行·列 → 标量）：外层 (i,j)、内层 k，一次算 1 个输出元素。<b>外积</b>（列·行 → 矩阵）：外层 k、内层 (i,j)，一次 k 更新整个输出块。</p>
+<svg id="s5d" viewBox="0 0 980 430"></svg>
+<div class="legend">
+  <span><i style="background:#155e8f"></i>A（2×3）</span>
+  <span><i style="background:#504099"></i>B（3×2）</span>
+  <span><i style="background:#7a5a13"></i>C（2×2）</span>
+  <span><i style="background:#fef08a"></i>本次参与计算的行/列/元素</span>
+</div>
+<h3>V4 vs V5：循环顺序决定复用率</h3>
+<table>
+  <tr><th></th><th>V4（registerSum）</th><th>V5（register tiling）</th></tr>
+  <tr><td>循环结构</td><td>for r → c → s，每个输出点扫一遍 K</td><td>for k → 装寄存器 → 8×8 外积</td></tr>
+  <tr><td>smem 读 / FMA</td><td>2 读 : 1 FMA</td><td>16 读 : 64 FMA = 1 : 4</td></tr>
+  <tr><td>操作数复用</td><td>无（重复读）</td><td>每个值复用 8 次</td></tr>
+  <tr><td>瓶颈</td><td>共享内存带宽</td><td>寄存器 / FMA 算力</td></tr>
+</table>
+</div>
+
+<h2>⑥ 共享内存布局：A 转置存，B 直存</h2>
+<div class="card">
+<div class="grid-2">
+<div>
+<h3>As[BK][BM] = As[8][128]（A 转置）</h3>
+<p style="font-size:13.5px">k 作行、m 作列。线程读 <code>As[k][threadRow..+7]</code> 时 <b>8 个元素地址连续</b> → 2 次 <code>float4</code> 读、无 bank conflict。</p>
+<svg id="s4a" viewBox="0 0 460 190"></svg>
+</div>
+<div>
+<h3>Bs[BK][BN] = Bs[8][128]（B 直存）</h3>
+<p style="font-size:13.5px">k 作行、n 作列。B 行主序天然 n 连续，<code>Bs[k][threadCol..+7]</code> 同样是 2 次 <code>float4</code>、无冲突，<b>所以 B 不需要转置</b>。</p>
+<svg id="s4b" viewBox="0 0 460 190"></svg>
+</div>
+</div>
+<div class="note">为什么转 A 不转 B：热循环固定 k 时，A 需要"沿 M 方向连续"（行主序里跨行不连续 → 必须转置），B 需要"沿 N 方向连续"（行主序里同行内天然连续 → 不用转）。</div>
+</div>
+
+<h2>⑦ 一次 K 迭代的完整数据流（可单步播放）</h2>
+<div class="card">
+<div class="legend">
+  <span><i style="background:var(--a)"></i>A 条带（全局内存）</span>
+  <span><i style="background:var(--b)"></i>B 条带（全局内存）</span>
+  <span><i style="background:var(--thread)"></i>共享内存 As / Bs</span>
+  <span><i style="background:var(--hi)"></i>当前阶段</span>
+</div>
+<svg id="s5" viewBox="0 0 980 360"></svg>
+<p style="margin:10px 0 6px"><span class="step-ind" id="stepTxt">准备就绪</span></p>
+<button class="btn" id="btnStep">下一步 →</button>
+<button class="btn ghost" id="btnAuto">▶ 自动播放</button>
+<button class="btn ghost" id="btnReset">重置</button>
+<div class="formula" id="codeView" style="min-height:34px">// 等待开始</div>
+</div>
+
+<h2>⑧ 资源账本与为什么快</h2>
+<div class="card">
+<table>
+  <tr><th>项目</th><th>V4（多 tile + 寄存器累加）</th><th>V5（register tiling + float4）</th></tr>
+  <tr><td>共享内存</td><td>perRowNum×perColNum 个 16×16 tile</td><td>As 4KB + Bs 4KB = 8KB</td></tr>
+  <tr><td>每 FMA 的 smem 读</td><td>2 次标量读（带宽瓶颈）</td><td>2/64 次（16 次读换 64 个 FMA）</td></tr>
+  <tr><td>smem 读指令</td><td>标量 LDS × N</td><td>float4 LDS（128-bit）</td></tr>
+  <tr><td>bank conflict</td><td>存在反复读取</td><td>A 转置 + float4 → 0 冲突</td></tr>
+  <tr><td>每线程寄存器</td><td>perRowNum×perColNum 个累加器</td><td>64 累加器 + a[8] + b[8] ≈ 80</td></tr>
+  <tr><td>写回全局</td><td>每 tile 一次</td><td>每 tile 一次（整个 K 循环结束）</td></tr>
+</table>
+<div class="note">V5 把"读共享内存"这个热路径操作量降到 V4 的 1/8，并用 float4 把指令数再 ÷4；转置 A 把冲突清零。代价是加载时 A 的 scatter 写有少量冲突，但写每 tile 只发生一次，读却发生在 8×8 外积的每一次——低频写冲突换高频读零冲突，稳赚。</div>
+</div>
+
+<h2>⑨ 下一步（V6 方向）</h2>
+<div class="card">
+<ul style="padding-left:22px; font-size:14px; line-height:2">
+  <li><b>BK=8 太小</b>：每 8 列就要一次 <code>__syncthreads</code>，流水线切太碎；经典配置 BK=16/32</li>
+  <li><b>双缓冲 + cp.async</b>：让第 kb+1 条带的加载与第 kb 条带的计算重叠，消除同步等待</li>
+  <li><b>ldmatrix</b>：用 Tensor Core 时代的方式把 smem → 寄存器转置加载，替代手写转置</li>
+  <li><b>L2 级分块</b>：让相邻 block 复用 A 的同一行块，减少全局带宽压力</li>
+</ul>
+</div>
+
+<script>
+// ============ 通用 SVG 网格绘制 ============
+let cur = null;   // 当前画布（cell 自动挂载到它）
+function cell(x,y,w,h,fill,stroke,op){ const r=document.createElementNS("http://www.w3.org/2000/svg","rect");
+  r.setAttribute("x",x); r.setAttribute("y",y); r.setAttribute("width",w); r.setAttribute("height",h);
+  r.setAttribute("fill",fill); if(stroke){r.setAttribute("stroke",stroke); r.setAttribute("stroke-width",1);}
+  if(op!=null) r.setAttribute("opacity",op); if(cur) cur.appendChild(r); return r; }
+function txt(x,y,s,size,fill,anchor,weight){ const t=document.createElementNS("http://www.w3.org/2000/svg","text");
+  t.setAttribute("x",x); t.setAttribute("y",y); t.setAttribute("font-size",size||12); t.setAttribute("fill",fill||"#e2e8f0");
+  t.setAttribute("text-anchor",anchor||"middle"); if(weight) t.setAttribute("font-weight",weight); t.textContent=s; return t; }
+function line(x1,y1,x2,y2,stroke,w,dash){ const l=document.createElementNS("http://www.w3.org/2000/svg","line");
+  l.setAttribute("x1",x1); l.setAttribute("y1",y1); l.setAttribute("x2",x2); l.setAttribute("y2",y2);
+  l.setAttribute("stroke",stroke); l.setAttribute("stroke-width",w||1);
+  if(dash) l.setAttribute("stroke-dasharray",dash);
+  if(cur) cur.appendChild(l); return l; }
+
+// ---------- ① C 切成 32×32 块：重点看 block(4,7) ----------
+(function(){
+  const g=document.getElementById("s1");
+  cur = g;
+  const s=128;                      // 128 个单位 → 128px（1px = 1 行/列）
+  const cx=560, cy=150;             // C tile 左上角
+  const bx=560, by=8, bh=130;       // B 条带（压缩了 4096 行）
+  const ax=300, ay=150, aw=140;     // A 条带（压缩了 4096 列）
+
+  // A 条带：第 4 行块 = rows 512~640 × 全部 K 列
+  cell(ax, ay, aw, s, "#155e8f", "#38bdf8", 1);
+  // B 条带：第 7 列块 = 全部 K 行 × cols 896~1024
+  cell(bx, by, s, bh, "#504099", "#a78bfa", 1);
+  // C 输出 tile：128×128
+  cell(cx, cy, s, s, "#8a5a13", "#fbbf24", 1);
+
+  // 行对齐虚线（rows 512~640 贯穿 A 和 C）
+  line(ax-18, ay, cx+s+26, ay, "#64748b", 1.2, "6 4");
+  line(ax-18, ay+s, cx+s+26, ay+s, "#64748b", 1.2, "6 4");
+  // 列对齐虚线（cols 896~1024 贯穿 B 和 C）
+  line(bx, by-16, bx, cy+s+22, "#64748b", 1.2, "6 4");
+  line(bx+s, by-16, bx+s, cy+s+22, "#64748b", 1.2, "6 4");
+
+  // A → C 箭头
+  line(ax+aw+4, ay+s/2, cx-12, ay+s/2, "#38bdf8", 2);
+  line(cx-14, ay+s/2-5, cx-5, ay+s/2, "#38bdf8", 2);
+  line(cx-14, ay+s/2+5, cx-5, ay+s/2, "#38bdf8", 2);
+  // B → C 箭头
+  line(bx+s/2, by+bh+4, bx+s/2, cy-12, "#a78bfa", 2);
+  line(bx+s/2-5, cy-14, bx+s/2, cy-5, "#a78bfa", 2);
+  line(bx+s/2+5, cy-14, bx+s/2, cy-5, "#a78bfa", 2);
+
+  // 轴标签
+  g.appendChild(txt(ax-22, ay+14, "row 512", 10.5, "#7dd3fc", "end"));
+  g.appendChild(txt(ax-22, ay+s-6, "row 640", 10.5, "#7dd3fc", "end"));
+  g.appendChild(txt(bx, by-22, "col 896", 10.5, "#c4b5fd"));
+  g.appendChild(txt(bx+s, by-22, "col 1024", 10.5, "#c4b5fd"));
+
+  // 条带说明
+  g.appendChild(txt(ax+aw/2, ay+s/2-16, "A 第 4 行块", 12.5, "#7dd3fc", null, 600));
+  g.appendChild(txt(ax+aw/2, ay+s/2+2, "rows 512~640", 10, "#94a3b8"));
+  g.appendChild(txt(ax+aw/2, ay+s/2+15, "× 全部 K=4096 列", 10, "#94a3b8"));
+  g.appendChild(txt(bx+s/2, by+bh/2-16, "B 第 7 列块", 12.5, "#c4b5fd", null, 600));
+  g.appendChild(txt(bx+s/2, by+bh/2+0, "全部 K=4096 行", 10, "#94a3b8"));
+  g.appendChild(txt(bx+s/2, by+bh/2+13, "× cols 896~1024", 10, "#94a3b8"));
+  g.appendChild(txt(cx+s/2, cy+s/2+12, "block(4,7) 输出 tile", 13, "#fde68a", null, 600));
+  g.appendChild(txt(cx+s/2, cy+s/2+30, "C[512..640) × [896..1024)", 10.5, "#fde68a"));
+
+  // 底部映射公式
+  g.appendChild(txt(490, 294, "blockIdx.y=4 → row 起点 = 4×128 = 512      blockIdx.x=7 → col 起点 = 7×128 = 896", 12, "#94a3b8"));
+})();
+
+// ---------- ② K 条带化：A 切竖条（横向排）、B 切横条（纵向堆） ----------
+(function(){
+  const g=document.getElementById("s2");
+  cur = g;
+  const kb=256, strips=512;
+
+  // ---- A 第 4 行块：128 行 × 4096 列 → 512 个竖条沿 K 横向排开 ----
+  const ax0=60, ay0=40, ah=100, pitchA=0.8;
+  for(let i=0;i<strips;i++){
+    const f = i<kb ? "#2b5d8a" : (i===kb ? "#ef4444" : "#4a5b74");
+    cell(ax0+i*pitchA, ay0, 1, ah, f);
+  }
+  cell(ax0+kb*pitchA-2, ay0-3, 6, ah+6, "none", "#ef4444");   // 高亮框
+  g.appendChild(txt(265, 24, "A 的第 4 行块：128 行 × 全部 K=4096 列", 12.5, "#38bdf8", null, 600));
+  cell(198, 112, 3, 26, "#38bdf8", null, 1);                    // 竖条 icon
+  g.appendChild(txt(231, 130, "每个竖条 = 128 行 × 8 列", 10.5, "#7dd3fc"));
+  g.appendChild(txt(ax0+kb*pitchA, ay0+ah+16, "第 256 个竖条：A[0..128) × K[2048..2056)", 11, "#f87171"));
+  g.appendChild(txt(ax0+204, ay0+ah+34, "→ K 方向（512 个竖条横向排开）", 10.5, "#94a3b8"));
+
+  // ---- B 第 7 列块：4096 行 × 128 列 → 512 个横条沿 K 纵向堆叠 ----
+  const bx0=600, by0=40, bw=128, pitchB=0.5;
+  for(let i=0;i<strips;i++){
+    const f = i<kb ? "#5b4b9e" : (i===kb ? "#ef4444" : "#4a5b74");
+    cell(bx0, by0+i*pitchB, bw, 0.5, f);
+  }
+  cell(bx0-3, by0+kb*pitchB-2, bw+6, 4.5, "none", "#ef4444");  // 高亮框
+  g.appendChild(txt(bx0+bw/2, 24, "B 的第 7 列块：全部 K=4096 行 × 128 列", 12.5, "#a78bfa"));
+  cell(748, 96, 26, 3, "#a78bfa", null, 1);                    // 横条 icon
+  g.appendChild(txt(748, 120, "每个横条 = 8 行 × 128 列", 10.5, "#c4b5fd"));
+  g.appendChild(txt(bx0+bw/2, by0+kb*pitchB+16, "第 256 个横条", 11, "#f87171"));
+  g.appendChild(txt(bx0+bw/2, by0+kb*pitchB+30, "K[2048..2056) × B[0..128)", 11, "#f87171"));
+  g.appendChild(txt(748, 152, "K 方向 ↓", 10.5, "#94a3b8"));
+  g.appendChild(txt(748, 168, "（512 个横条纵向堆叠）", 10.5, "#94a3b8"));
+
+  // 中部说明
+  g.appendChild(txt(505, 160, "每次迭代：搬一对条带进共享内存", 11.5, "#e2e8f0"));
+  g.appendChild(txt(505, 178, "128×8 竖条 → As[8][128]（转置存）", 11, "#7dd3fc"));
+  g.appendChild(txt(505, 196, "8×128 横条 → Bs[8][128]（直存）", 11, "#c4b5fd"));
+})();
+
+// ---------- ③ 块内线程分工 ----------
+(function(){
+  const g=document.getElementById("s3");
+  cur = g;
+  const cellS=7.5, oy=40, ox=420;
+  // 128×128 tile → 16×16 个 8×8 微块
+  for(let ty=0;ty<16;ty++) for(let tx=0;tx<16;tx++){
+    const f = (ty===3&&tx===9) ? "#10b981" : "#14532d";
+    cell(ox+tx*(cellS+1), oy+ty*(cellS+1), cellS, cellS, f, "#22c55e", 0.9);
+  }
+  // 放大线程(3,9)的 8×8 微块
+  const mx=680, my=oy+3*(cellS+1), s=3;
+  for(let m=0;m<8;m++) for(let n=0;n<8;n++)
+    cell(mx+n*(s+.8), my+m*(s+.8), s, s, m===2&&n===5 ? "#fef08a" : "#10b981");
+  // 该线程读的 A 片段 / B 片段
+  cell(60, oy+3*(cellS+1), 8*(s+.8)-.8, (s+.8), "#38bdf8");   // 8 行 × k 方向示意
+  cell(60, 190, 8*(s+.8)-.8, (s+.8), "#a78bfa");
+  g.appendChild(txt(420,30,"block 内 128×128 tile：切成 16×16 个 8×8 微块",12,"#e2e8f0",null,600));
+  g.appendChild(txt(ox+9*(cellS+1), oy+3*(cellS+1)+16, "线程(ty=3,tx=9)",11,"#34d399"));
+  g.appendChild(txt(mx+12, my-8, "该线程的 8×8 微块 acc[8][8]",11,"#34d399"));
+  g.appendChild(txt(100, oy+3*(cellS+1)+14, "读 As[k][24..32)（8 个元素，float4×2）",10.5,"#7dd3fc"));
+  g.appendChild(txt(100, 208, "读 Bs[k][72..80)（8 个元素，float4×2）",10.5,"#c4b5fd"));
+  g.appendChild(txt(60, 60, "每个线程 64 个寄存器累加器，K 循环 512 轮全部在寄存器里累加",11,"#94a3b8"));
+  g.appendChild(txt(60, 250, "整个 K 循环结束才把 acc 写回全局内存一次",11,"#94a3b8"));
+})();
+
+// ---------- ⑥ 共享内存布局 ----------
+function drawSmem(g, transposed){
+  cur = g;
+  const cols=128, rows=8, cw=2.6, rh=14, ox=20, oy=40;
+  for(let k=0;k<rows;k++) for(let j=0;j<cols;j++){
+    cell(ox+j*cw, oy+k*rh, cw-0.4, rh-3, transposed? (j>=24&&j<32 ? "#7dd3fc" : "#155e8f") : (j>=72&&j<80 ? "#c4b5fd" : "#504099"));
+  }
+  g.appendChild(txt(ox+cols*cw/2, oy-12, transposed? "As[8][128]：A 条带转置存储" : "Bs[8][128]：B 条带直接存储",12,"#e2e8f0",null,600));
+  for(let k=0;k<rows;k++) g.appendChild(txt(ox-10, oy+k*rh+11, "k="+k,9,"#64748b","end"));
+  g.appendChild(txt(ox+cols*cw/2, oy+rows*rh+14, transposed? "→ 列方向 m = 128（沿 M 连续）" : "→ 列方向 n = 128（沿 N 连续）",11,"#94a3b8"));
+  if(transposed){
+    cell(ox+24*cw, oy, 8*cw, rows*rh, "none", "#fef08a");
+    g.appendChild(txt(ox+24*cw, oy+rows*rh+30, "高亮：线程(3,9)读 As[k][24..32)，地址连续 → float4×2、0 冲突",10.5,"#fef08a"));
+  } else {
+    cell(ox+72*cw, oy, 8*cw, rows*rh, "none", "#fef08a");
+    g.appendChild(txt(ox+72*cw, oy+rows*rh+30, "高亮：线程(3,9)读 Bs[k][72..80)，地址连续 → float4×2、0 冲突",10.5,"#fef08a"));
+  }
+}
+(function(){ drawSmem(document.getElementById("s4a"), true); drawSmem(document.getElementById("s4b"), false); })();
+
+// ---------- ④ 线程搬运分工：256 个 float4 ----------
+(function(){
+  const g=document.getElementById("s35");
+  cur=g;
+
+  // A 条带（压缩视图：128 行 × 2 个 float4 组）
+  const ax=60, ay=40, rh=2, gw=16, gs=2;
+  for(let r=0;r<128;r++){
+    cell(ax, ay+r*rh, gw, rh, "#155e8f", "#38bdf8", 0.9);
+    cell(ax+gw+gs, ay+r*rh, gw, rh, "#1e6eb0", "#38bdf8", 0.9);
+  }
+  g.appendChild(txt(ax+17, ay-14, "A 条带：128 行 × 8 列", 12, "#7dd3fc", null, 600));
+  g.appendChild(txt(ax+17, ay+128*rh+14, "= 256 个 float4", 10.5, "#94a3b8"));
+
+  // A 放大框：第 0~3 行的线程分配
+  const zx=150, zy=40, zrh=12, zgw=18, zgs=3;
+  for(let r=0;r<4;r++){
+    cell(zx, zy+r*zrh, zgw, zrh-2, "#155e8f", "#38bdf8", 1);
+    cell(zx+zgw+zgs, zy+r*zrh, zgw, zrh-2, "#1e6eb0", "#38bdf8", 1);
+    g.appendChild(txt(zx+zgw*2+zgs*2+4, zy+r*zrh+8, "线程 "+(2*r)+"、"+(2*r+1)+" → 第 "+r+" 行", 10, "#7dd3fc", "start"));
+  }
+  g.appendChild(txt(zx+20, zy+4*zrh+16, "↓ 每 2 个线程搬 1 行", 10, "#94a3b8"));
+  g.appendChild(txt(zx+20, zy+4*zrh+30, "线程 254、255 → 第 127 行", 10, "#7dd3fc"));
+
+  // B 条带（1px/列 × 14px/行）
+  const bx=600, by=40, brh=14;
+  for(let r=0;r<8;r++){
+    for(let f4=0;f4<32;f4++){
+      cell(bx+f4*4, by+r*brh, 4, brh-2, f4%2 ? "#5b4b9e" : "#504099", "#a78bfa", 0.9);
+    }
+    g.appendChild(txt(bx+134, by+r*brh+9, "线程 "+(32*r)+"~"+(32*r+31), 10, "#c4b5fd", "start"));
+  }
+  g.appendChild(txt(bx+64, by-14, "B 条带：8 行 × 128 列 = 256 个 float4", 12, "#c4b5fd"));
+  g.appendChild(txt(bx+64, by+8*brh+16, "每 32 个线程搬 1 行", 10.5, "#94a3b8"));
+
+  // 中部：线程编号
+  g.appendChild(txt(470, 60, "线程线性编号", 11.5, "#e2e8f0", null, 600));
+  g.appendChild(txt(470, 78, "i = ty × 16 + tx", 13, "#fef08a", null, 600));
+  g.appendChild(txt(470, 96, "（tx 变化最快：同行左右相邻）", 10.5, "#94a3b8"));
+
+  // float4 放大
+  cell(420, 150, 10, 10, "#fef08a", "#fde68a", 1);
+  cell(432, 150, 10, 10, "#fef08a", "#fde68a", 1);
+  cell(444, 150, 10, 10, "#fef08a", "#fde68a", 1);
+  cell(456, 150, 10, 10, "#fef08a", "#fde68a", 1);
+  g.appendChild(txt(438, 182, "1 个 float4 = 4 个连续 float", 10.5, "#fde68a"));
+  g.appendChild(txt(438, 196, "= 16 字节（一次 128-bit 访存）", 10.5, "#94a3b8"));
+
+  // 合并访存
+  g.appendChild(txt(380, 232, "warp 0（线程 0~31）的访存：", 11.5, "#e2e8f0", null, 600));
+  g.appendChild(txt(380, 250, "A：第 0~15 行 × 每行 32B 连续 = 512B 完全合并", 10.5, "#7dd3fc"));
+  g.appendChild(txt(380, 266, "B：第 0 行整行 512B 连续 = 完全合并", 10.5, "#c4b5fd"));
+
+  // 写入差异
+  g.appendChild(txt(380, 296, "写共享内存：A 转置 scatter 写（2-way 冲突，转置的代价）", 10.5, "#94a3b8"));
+  g.appendChild(txt(380, 312, "B 连续写（编译器合并成 1 次 128-bit 写）", 10.5, "#94a3b8"));
+
+  // 底部总结
+  g.appendChild(txt(490, 338, "256 线程 × 1 float4 = 256 float4 = 1024 floats ✓    BK=16 时 512 float4 → 每线程自动搬 2 轮（循环步长 256）", 11, "#94a3b8"));
+})();
+
+// ---------- ⑤ 计算部分：逐 k 外积 ----------
+(function(){
+  const g=document.getElementById("s5c");
+  cur=g;
+  const cw=2.6, rh=14;
+  // As[8][128]
+  const ax=40, ay=40;
+  for(let k=0;k<8;k++) for(let j=0;j<128;j++)
+    cell(ax+j*cw, ay+k*rh, cw-0.4, rh-3, (j>=24&&j<32) ? "#7dd3fc" : "#155e8f");
+  g.appendChild(txt(ax+166, ay-14, "As[8][128]（转置，见下一节）", 12, "#7dd3fc", null, 600));
+  cell(ax+24*cw-1, ay-3, 8*cw+2, 8*rh+3, "none", "#fef08a");
+  // Bs[8][128]
+  const bx=40, by=200;
+  for(let k=0;k<8;k++) for(let j=0;j<128;j++)
+    cell(bx+j*cw, by+k*rh, cw-0.4, rh-3, (j>=72&&j<80) ? "#c4b5fd" : "#504099");
+  g.appendChild(txt(bx+166, by-14, "Bs[8][128]", 12, "#c4b5fd", null, 600));
+  cell(bx+72*cw-1, by-3, 8*cw+2, 8*rh+3, "none", "#fef08a");
+  // acc[8][8]
+  const cx=500, cy=90, cs=16;
+  for(let m=0;m<8;m++) for(let n=0;n<8;n++)
+    cell(cx+n*cs, cy+m*cs, cs-2, cs-2, "#10b981");
+  g.appendChild(txt(cx+64, cy-16, "acc[8][8]：64 个寄存器累加器", 12.5, "#34d399", null, 600));
+  // 箭头 As→acc、Bs→acc
+  line(ax+32*cw+4, ay+4*rh, cx-10, cy+2*cs, "#7dd3fc", 2);
+  line(cx-12, cy+2*cs-5, cx-4, cy+2*cs, "#7dd3fc", 2);
+  line(cx-12, cy+2*cs+5, cx-4, cy+2*cs, "#7dd3fc", 2);
+  line(bx+80*cw+4, by+4*rh, cx-10, cy+6*cs, "#c4b5fd", 2);
+  line(cx-12, cy+6*cs-5, cx-4, cy+6*cs, "#c4b5fd", 2);
+  line(cx-12, cy+6*cs+5, cx-4, cy+6*cs, "#c4b5fd", 2);
+  g.appendChild(txt(ax+32*cw+44, ay+4*rh-10, "a[8]（8 个 A 值）", 10.5, "#7dd3fc", "start"));
+  g.appendChild(txt(bx+80*cw+44, by+4*rh+16, "b[8]（8 个 B 值）", 10.5, "#c4b5fd", "start"));
+  g.appendChild(txt(cx+64, cy+8*cs+22, "外积 a[m] × b[n] → acc[m][n]", 11, "#94a3b8"));
+  g.appendChild(txt(cx+64, cy+8*cs+38, "k 从 0 累加到 7", 11, "#94a3b8"));
+  g.appendChild(txt(490, 346, "微块 8×8 = Σ_{k=0..7} As[k][24..32) ⊗ Bs[k][72..80)", 12, "#e2e8f0"));
+
+  // k 高亮（两个 outline 定位到当前行）
+  const asK = cell(ax+24*cw-1, ay-1, 8*cw+2, rh-1, "none", "#ef4444");
+  const bsK = cell(bx+72*cw-1, by-1, 8*cw+2, rh-1, "none", "#ef4444");
+  let kCur=-1, kTimer=null;
+  function showK(k){
+    kCur=k;
+    if(k<0){
+      asK.setAttribute("opacity","0"); bsK.setAttribute("opacity","0");
+      document.getElementById("kTxt").textContent="点击「k + 1」逐轮看外积累加";
+      return;
+    }
+    asK.setAttribute("opacity","1"); bsK.setAttribute("opacity","1");
+    asK.setAttribute("y", ay+k*rh-1); bsK.setAttribute("y", by+k*rh-1);
+    document.getElementById("kTxt").textContent="当前 k="+k+"：As["+k+"][24..32) ⊗ Bs["+k+"][72..80) → acc += 外积";
+  }
+  showK(-1);
+  document.getElementById("kStep").onclick=function(){ if(kTimer){clearInterval(kTimer);kTimer=null;} showK((kCur+1)%8); };
+  document.getElementById("kAuto").onclick=function(){ if(kTimer){clearInterval(kTimer);kTimer=null;return;} kTimer=setInterval(function(){ showK((kCur+1)%8); }, 1100); };
+  document.getElementById("kReset").onclick=function(){ if(kTimer){clearInterval(kTimer);kTimer=null;} showK(-1); };
+})();
+
+// ---------- ⑤ 补充：内积 vs 外积 ----------
+(function(){
+  const g=document.getElementById("s5d");
+  cur=g;
+  const cs=26, step=29;
+  function arrow(x1,y1,x2,y2,col){
+    line(x1,y1,x2,y2,col,2);
+    line(x2-10,y2-4,x2,y2,col,2);
+    line(x2-10,y2+4,x2,y2,col,2);
+  }
+  function drawPanel(baseY, mode){
+    const inner = (mode==='inner');
+    // A 2×3
+    const ax=60, ay=baseY+30;
+    for(let i=0;i<2;i++) for(let j=0;j<3;j++){
+      const hl = inner ? (i===0) : (j===0);
+      cell(ax+j*step, ay+i*step, cs, cs, hl ? "#fef08a" : "#155e8f", "#38bdf8", 1);
+    }
+    // B 3×2
+    const bx=215, by=baseY+30;
+    for(let i=0;i<3;i++) for(let j=0;j<2;j++){
+      const hl = inner ? (j===0) : (i===0);
+      cell(bx+j*step, by+i*step, cs, cs, hl ? "#fef08a" : "#504099", "#a78bfa", 1);
+    }
+    // C 2×2
+    const cx=385, cy=baseY+30;
+    for(let i=0;i<2;i++) for(let j=0;j<2;j++){
+      const hl = inner ? (i===0 && j===0) : true;
+      cell(cx+j*step, cy+i*step, cs, cs, hl ? "#fef08a" : "#7a5a13", "#fbbf24", 1);
+    }
+    // 标题
+    g.appendChild(txt(300, baseY+16, inner ? "内积（V4 思路）：行·列 → 标量，一次算 1 个元素" : "外积（V5 思路）：列·行 → 矩阵，一次 k 更新整块", 13.5, "#e2e8f0", null, 600));
+    // 矩阵名
+    g.appendChild(txt(ax+43, ay+2*step+16, "A (2×3)", 11, "#38bdf8"));
+    g.appendChild(txt(bx+29, by+3*step+16, "B (3×2)", 11, "#a78bfa"));
+    g.appendChild(txt(cx+29, cy+2*step+16, "C (2×2)", 11, "#fbbf24"));
+    // 箭头
+    if(inner){
+      arrow(ax+3*step, ay+13, cx-8, cy+13, "#38bdf8");    // A 第0行 → C(0,0)
+      arrow(bx+13, by+13, cx-8, cy+13, "#a78bfa");        // B 第0列 → C(0,0)
+    } else {
+      arrow(ax+3*step, ay+step+13, cx-8, cy+13, "#38bdf8");   // A 第k列 → C 整块
+      arrow(bx+2*step, by+13, cx-8, cy+step+13, "#a78bfa");   // B 第k行 → C 整块
+    }
+    // 公式
+    const f = inner
+      ? "C[0][0] = A[0][0]·B[0][0] + A[0][1]·B[1][0] + A[0][2]·B[2][0]"
+      : "C += A[:,k] ⊗ B[k,:]     每个 k 加一个 rank-1 矩阵（2×2 共 4 个 FMA）";
+    g.appendChild(txt(300, baseY+152, f, 12.5, "#7dd3fc", null, 600));
+    // 复用说明
+    const n = inner
+      ? "A 的行、B 的列只服务这 1 个输出；换下一个元素又要重读一遍 A 行 / B 列"
+      : "a[m] 复用于所有 n，b[n] 复用于所有 m —— 读 16 次换 64 个 FMA（V5 快的关键）";
+    g.appendChild(txt(300, baseY+174, n, 11.5, "#94a3b8", null, 600));
+  }
+  drawPanel(0, 'inner');
+  drawPanel(215, 'outer');
+})();
+
+// ---------- ⑦ 数据流动画 ----------
+const stages = [
+  { name:"① float4 加载 A 条带", code:"// 每个线程循环跨步，128×8 共 256 个 float4\nfloat4 v = *(float4*)&APtr[aRow*K + kb + aCol];" },
+  { name:"② scatter 转置写入 As", code:"As[aCol+0][aRow]=v.x; As[aCol+1][aRow]=v.y;\nAs[aCol+2][aRow]=v.z; As[aCol+3][aRow]=v.w;  // 转置：k 变行" },
+  { name:"③ float4 加载 B 条带，直写 Bs", code:"float4 v = *(float4*)&BPtr[(kb+bRow)*N + bCol];\nBs[bRow][bCol..+4] = v;             // 无需转置" },
+  { name:"④ __syncthreads()", code:"__syncthreads();  // 等 256 个线程都写完共享内存" },
+  { name:"⑤ 读 smem → 寄存器（float4×4）", code:"float4 a0=*(float4*)&As[k][threadRow];   // 8 个 A 元素\na0,a1 + b0,b1 → a[8], b[8] 寄存器" },
+  { name:"⑥ 8×8 外积，64 个 FMA", code:"for(m) for(n) acc[m][n] += a[m] * b[n];   // 64 FMA 全在寄存器" },
+  { name:"⑦ k++ 继续；KB 轮后写回", code:"// 512 轮循环后：\nCPtr[(threadRow+m)*N + threadCol+n] = acc[m][n];  // 只写 1 次" },
+];
+let stage = -1, timer = null;
+const s5 = document.getElementById("s5");
+function buildS5(){
+  cur = s5;
+  // 全局 A 条带
+  const gax=60, gay=70;
+  for(let r=0;r<16;r++) cell(gax, gay+r*14, 8*8, 9, "#155e8f", "#38bdf8", 0.9);
+  cell(gax, gay, 8*8, 16*14, "none", "#38bdf8");
+  s5.appendChild(txt(gax+32, gay-10, "A 条带 128×8",12,"#38bdf8",null,600));
+  // 全局 B 条带
+  const gbx=60, gby=260;
+  for(let r=0;r<8;r++) cell(gbx, gby+r*14, 16*8, 9, "#504099", "#a78bfa", 0.9);
+  cell(gbx, gby, 16*8, 8*14, "none", "#a78bfa");
+  s5.appendChild(txt(gbx+64, gby-10, "B 条带 8×128",12,"#a78bfa",null,600));
+  // 共享内存 As / Bs
+  for(let k=0;k<8;k++) for(let j=0;j<128;j++)
+    cell(330+j*2.6, 70+k*14, 2.2, 10, "#155e8f");
+  s5.appendChild(txt(330+166, 58, "As[8][128]（转置）",11,"#34d399",null,600));
+  for(let k=0;k<8;k++) for(let j=0;j<128;j++)
+    cell(330+j*2.6, 260+k*14, 2.2, 10, "#504099");
+  s5.appendChild(txt(330+166, 248, "Bs[8][128]",11,"#34d399",null,600));
+  // 寄存器 + acc
+  cell(780, 90, 130, 100, "#0b1220", "#10b981");
+  s5.appendChild(txt(845, 118, "acc[8][8]",14,"#34d399",null,600));
+  s5.appendChild(txt(845, 140, "64 个累加器",11,"#94a3b8"));
+  for(let m=0;m<8;m++) for(let n=0;n<8;n++)
+    cell(790+n*11, 150+m*11, 9, 9, m===2&&n===5 ? "#fef08a" : "#10b981");
+  // 箭头
+  s5.appendChild(txt(230, 160, "──▶",18,"#64748b"));
+  s5.appendChild(txt(230, 300, "──▶",18,"#64748b"));
+  s5.appendChild(txt(760, 160, "──▶",18,"#64748b"));
+}
+buildS5();
+function applyStage(i){
+  if(i<0){ document.getElementById("stepTxt").textContent="准备就绪（点击下一步开始）"; document.getElementById("codeView").innerHTML="// 等待开始"; return; }
+  const s=stages[i];
+  document.getElementById("stepTxt").textContent = "第 "+(i+1)+"/7 步 · "+s.name;
+  document.getElementById("codeView").innerHTML = s.code.replace(/\n/g,"<br>");
+  // 高亮
+  const A=s5.querySelectorAll("rect"), nothing=0;
+}
+document.getElementById("btnStep").onclick=function(){ if(timer){clearInterval(timer);timer=null;}
+  stage=(stage+1)%stages.length; applyStage(stage); };
+document.getElementById("btnAuto").onclick=function(){
+  if(timer){clearInterval(timer);timer=null; return;}
+  timer=setInterval(function(){ stage=(stage+1)%stages.length; applyStage(stage); }, 1800); };
+document.getElementById("btnReset").onclick=function(){ if(timer){clearInterval(timer);timer=null;} stage=-1; applyStage(-1); };
+</script>
+</body>
+</html>

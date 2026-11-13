@@ -1,0 +1,38 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-msvc-cuda",
+      "displayName": "Windows MSVC 2026 + CUDA",
+      "description": "Visual Studio 2026 生成器 + MSVC 宿主编译器 + CUDA 13.5",
+      "generator": "Visual Studio 18 2026",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "120"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc-cuda-release",
+      "displayName": "Release",
+      "configurePreset": "windows-msvc-cuda",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-msvc-cuda-debug",
+      "displayName": "Debug",
+      "configurePreset": "windows-msvc-cuda",
+      "configuration": "Debug"
+    }
+  ]
+}

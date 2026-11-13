@@ -1,0 +1,15 @@
+# CMake 构建产物
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+*.vcxproj.user
+
+# 编译产物
+*.obj
+*.exe
+*.pdb
+*.lib
+*.dll
+*.exp
+*.ilk
